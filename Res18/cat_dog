@@ -1,0 +1,278 @@
+from torchvision import datasets
+import torchvision.transforms as transforms
+from torch.utils.data.sampler import SubsetRandomSampler
+import torch
+import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+#加入以下的代码是为了防止下面的错误，做的事就是指定一张显卡
+#RuntimeError: CUDA error: device-side assert triggered [349] CUDA kernel errors might be asynchronou
+import os
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+#region 一.准备工作
+
+#region 1.1参数设置
+
+train_on_gpu = torch.cuda.is_available()
+
+if not train_on_gpu:
+    print('CUDA is not available.  Training on CPU ...')
+else:
+    print('CUDA is available!  Training on GPU ...')
+
+# number of subprocesses to use for data loading
+num_workers = 0
+# 采样批次
+batch_size = 5
+# 验证集比例
+valid_size = 0.2
+#测试集、训练集、验证集。
+#test、train
+#endregion
+
+#1.2数据集的处理
+#1.2.1数据增强
+transform = transforms.Compose([
+    transforms.Resize([224,224]),#调整大小
+    transforms.RandomVerticalFlip(p=0.2),#依据概率p对PIL图片进行垂直翻转
+    # transforms.RandomCrop(50),#随机裁剪后输出的大小
+    transforms.ToTensor(),
+    transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+
+#1.2.2选择数据
+train_data = datasets.ImageFolder(r'C:\Users\11366\Desktop\深度学习\study\Cat_Dog_data\train',
+                               transform=transform)
+test_data = datasets.ImageFolder(r'C:\Users\11366\Desktop\深度学习\study\Cat_Dog_data\test',
+                               transform=transform)
+
+#1.2.3确定验证集随机采样
+num_train = len(train_data)
+indices = list(range(num_train))#确定验证集图片个数
+np.random.shuffle(indices)#打乱顺序
+split = int(np.floor(valid_size * num_train))
+train_idx, valid_idx = indices[split:], indices[:split]#【起始从第几个：末尾从第几个：步长】
+train_sampler = SubsetRandomSampler(train_idx)#这里是确定我采样的顺序，意思是后面在制作train_loader的时候我用这个列表得索引值取样本
+valid_sampler = SubsetRandomSampler(valid_idx)
+
+#1.2.4确定数据集
+train_loader = torch.utils.data.DataLoader(train_data,batch_size=batch_size,sampler=train_sampler,num_workers=num_workers)
+valid_loader = torch.utils.data.DataLoader(train_data,batch_size=batch_size,sampler=valid_sampler,num_workers=num_workers)
+test_loader = torch.utils.data.DataLoader(test_data,batch_size=batch_size,num_workers=num_workers)
+
+#1.2.5确定输出分类
+classes = ['cat', 'dog']
+#endregion
+
+#region 二.确定网络
+class BasicBlock(nn.Module):
+    def __init__(self,in_channels,out_channels,stride=[1,1],padding=1) -> None:
+        super(BasicBlock, self).__init__()
+        # 残差部分
+        #一。layer部分不改变特征图尺寸
+        self.layer = nn.Sequential(
+            nn.Conv2d(in_channels,out_channels,kernel_size=3,stride=stride[0],padding=padding,bias=False),#尺寸不变
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True), # 原地替换 节省内存开销
+            nn.Conv2d(out_channels,out_channels,kernel_size=3,stride=stride[1],padding=padding,bias=False),#尺寸不变
+            nn.BatchNorm2d(out_channels)
+        )
+
+        #二。 shortcut 部分
+        '''
+        如果输入输出通道不同，或者卷积步长做了改变，那就用if中的模型，否则不变。这里肯定是输入输出通道要改变的
+        这里的shortcut模块就是将原来的特征图通过1*1卷积提高通道数
+        '''
+        # 由于存在维度不一致的情况 所以分情况
+        self.shortcut = nn.Sequential()
+        if stride[0] != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                # 卷积核为1 进行升降维
+                # 注意跳变时 都是stride==2的时候 也就是每次输出信道升维的时候
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride[0], bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        out = self.layer(x)
+        out += self.shortcut(x)#和原特征图相加
+        out = F.relu(out)
+        return out
+
+class ResNet18(nn.Module):
+    def __init__(self, BasicBlock, num_classes=1) -> None:#这里注意num_class是1，因为最后我们要输出一个0-1之间的数，小于0.5的作为一类，大于0.5的又作为一类
+        super(ResNet18, self).__init__()
+        self.in_channels = 64
+        # 第一层作为单独的 因为没有残差块。224*224*3
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3,64,kernel_size=7,stride=2,padding=3,bias=False),#224*224*3【（224-7+2*3）/2+1=112.5】-112*112*3这里为啥是112了？
+            nn.BatchNorm2d(64),#对应上一层的所有特征图做归一化
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)#112*112*64-56*56*64  （112-3）/2 +1 =55.5=56
+        )
+        # conv2_x
+        self.conv2 = self._make_layer(BasicBlock,64,[[1,1],[1,1]])#56*56*64-56*56*64
+
+        # conv3_x
+        self.conv3 = self._make_layer(BasicBlock,128,[[2,1],[1,1]])#56*56*64-56*56*128
+
+        # conv4_x
+        self.conv4 = self._make_layer(BasicBlock,256,[[2,1],[1,1]])#56*56*128-56*56*256
+
+        # conv5_x
+        self.conv5 = self._make_layer(BasicBlock,512,[[2,1],[1,1]])#56*56*256-56*56*512
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+
+    '''通过此函数方便的构造残差模块，
+          bock就是BlasicBlock。
+          输入通道是递接上一层通道的，
+          输出通道自行确定。
+          strides中写入几个stride的列表此layer就有几个残差模块，另外stride的值都选[1,1]，比较方便,尺寸就不会变了
+    '''
+    def _make_layer(self, block, out_channels, strides):
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_channels, out_channels, stride))
+            self.in_channels = out_channels
+        return nn.Sequential(*layers)
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = self.conv3(out)
+        out = self.conv4(out)
+        out = self.conv5(out)
+
+        # out = F.avg_pool2d(out,7)
+        out = self.avgpool(out)
+        out = out.reshape(x.shape[0], -1)
+        out = torch.sigmoid(self.fc(out))#这里加入sigmoid以保证在0-1之间。而且最好调用torch.sigmod而非F.sigmod
+        return out
+
+model=ResNet18(BasicBlock=BasicBlock)
+print(model)
+#endregion
+
+#region 三. 训练-train/val
+
+#3.1设置训练参数
+model = model.cuda()#模型还在cpu要放到gpu里
+optimizer = torch.optim.SGD(model.parameters(),lr=0.01)
+n_epochs = 8  #训练轮次
+valid_loss_min = np.Inf#np.inf表示正无穷大，-np.inf表示负无穷大
+
+#3.2开始循环训练
+for epoch in range(1, n_epochs + 1):#epoch从1到9重复执行下列代码8次
+
+    # 设置损失
+    train_loss = 0.0
+    valid_loss = 0.0
+
+    ###################
+    #      训练模块     #
+    ###################
+    model.train()
+    for data, target in train_loader:
+
+        # 在gpu上去训练
+        if train_on_gpu:#在gpu上运行
+            data, target = data.cuda(), target.cuda().float().unsqueeze(1)
+            '''
+            这里的target要注意，原本的数据格式和data是不同的，两个区别：1.差了一个维度2.data是float二target是int。相同点：数据是一样的
+            两者的类型必须完全相同我才能放进BCE中去算loss。这个float是把int变float。unsqueeze是把维度加1
+            这里不要去改output。
+            另外target在后面计算精确度的时候一定注意必须是和从data直接提取的数据的格式相同!!!
+            '''
+        optimizer.zero_grad()#将梯度清零
+        output = model(data)#得到输出
+        #如果，模型中用的sigmoid，那输出必须都在0-1，否则就有问题
+        loss = F.binary_cross_entropy(output, target)#求loss，loss是个tensor是一个数，loss: tensor(2.2984,device='cuda:0',grad_fn=<NllLossBackward>)
+        loss.backward()#求方向传播得梯度
+        optimizer.step()#反向传播
+        train_loss += loss.item() * data.size(0)
+        #.item()是为了获得loss中不需要反向传播得内容，loss是一个张量，如上所示，所以这里得加item（）。size(0)是为了得到第0维数据的数量，这里是0维表示的是batchisize，所以loss计算是计算出一个loss然后乘以batchsize20
+        #data.size(0)为20因为data的shape是[20,3,32,32]
+    ######################
+    #       验证模块       #
+    ######################
+    model.eval()#下面的不做反向传播，即为验证部分
+    for data, target in valid_loader:
+        # 在gpu上计算
+        if train_on_gpu:
+            data, target = data.cuda(), target.cuda().float().unsqueeze(1)
+        output = model(data)
+        loss = F.binary_cross_entropy(output, target)#计算loss
+        valid_loss += loss.item() * data.size(0)#计算验证损失
+
+    train_loss = train_loss / len(train_loader.dataset)#计算平均损失
+    valid_loss = valid_loss / len(valid_loader.dataset)
+
+    # 输出tain_loss和valid_loss
+    print('Epoch: {} \tTraining Loss: {:.6f} \tValidation Loss: {:.6f}'.format(
+        epoch, train_loss, valid_loss))
+
+    #保存模型权重
+    if valid_loss <= valid_loss_min:
+    #valid_loss_min = np.Inf，第一轮验证一下是否是无穷不是无穷则保存此valid_loss
+    #第二轮，验证一下此轮损失是否比上一轮小，小的话则保存新的这个损失并且保存新的权重
+        print('Validation loss decreased ({:.6f} --> {:.6f}).  Saving model ...'.format(
+            valid_loss_min,
+            valid_loss))
+        torch.save(model.state_dict(), 'res18.pt')
+        valid_loss_min = valid_loss
+#endregion
+
+#region 四.测试
+#4.1设置参数
+test_loss = 0.0#设置好test_loss认定为一个精度值
+class_correct = list(0. for i in range(2))#[0.0, 0.0]
+class_total = list(0. for i in range(2))#[0.0, 0.0]
+
+#4.2开始测试
+model.eval()#model不反向传播
+state_dict=torch.load('res18.pt')
+model.load_state_dict(state_dict)
+for data, target in test_loader:#按照test_loader设置好的batch_size进行采样
+    if train_on_gpu:
+        data, target = data.cuda(), target.cuda()
+    output = model(data)
+    target1 = target.float().unsqueeze(1)
+    loss = F.binary_cross_entropy(output, target1)
+    test_loss += loss.item()*data.size(0)
+
+    pred = torch.tensor([[1] if num[0] >= 0.5 else [0] for num in output]).cuda()
+    #通过此行代码求得索引值，这里预测得到的小于0.5的shiwei0，大于0.5的视为1。以此分类
+
+    # 获得预测结果的正确与否
+    correct_tensor = pred.eq(target.data.view_as(pred))
+    #x.eq(y)判断x和y的值是否相等，作比较以后输出新的tensor 这里的view_as和view一样都是调整格式只不过view是将target调整成和pred一样的格式，这里其实没变他俩格式都是Tensor（20，）
+    correct = np.squeeze(correct_tensor.numpy()) if not train_on_gpu else np.squeeze(correct_tensor.cpu().numpy())#改成np格式[ True  True  True  True  True]
+    # 计算准确值
+    for i in range(batch_size):#这里再按照batch_size的值遍历
+        label = target.data[i]#第一轮就是第一个图片的标签是3 tensor(3, device='cuda:0')
+        #label=tensor([0.], device='cuda:0')
+        class_correct[label] += correct[i].item()#【40，46】#注意这里头的label应该是：1.1个整数2.是张量的话只能是包含一个数的张量。所以这里用label做索引，labela选的target的数据就不能去增加维数，也不能变为精度型
+        class_total[label] += 1#【50，50】
+
+test_loss = test_loss/len(test_loader.dataset)#计算平均损失
+print('Test Loss: {:.6f}\n'.format(test_loss))
+#endregion
+
+#region 五.获取精确度
+#通过得到的class_correct[i]和class_total[i]计算精度
+for i in range(2):
+    if class_total[i] > 0:
+        print('Test Accuracy of %5s: %2d%% (%2d/%2d)' % (
+            classes[i], 100 * class_correct[i] / class_total[i],
+            np.sum(class_correct[i]), np.sum(class_total[i])))#Test Accuracy of airplane: 46% (469/1000)这里np.sum这个sum无所谓，对于此项目每个类别的预测结果就是个数不是列表，这个sum应该是为了和其他模型的结果契合
+    else:
+        print('Test Accuracy of %5s: N/A (no training examples)' % (classes[i]))
+
+print('\nTest Accuracy (Overall): %2d%% (%2d/%2d)' % (
+    100. * np.sum(class_correct) / np.sum(class_total),
+    np.sum(class_correct), np.sum(class_total)))#算个总的预测精度
+#endregion
